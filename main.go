@@ -172,6 +172,7 @@ func getDlinkRaw(client *http.Client, dlink string) (string, error) {
 // =========================
 type FileInfo struct {
 	Name  string
+	Size  int64 // Tambahan untuk menyimpan ukuran file
 	Dlink string
 }
 
@@ -193,10 +194,25 @@ func collectAllFiles(client *http.Client, surl string, path string, files *[]Fil
 			} else if val, ok := item["isdir"].(float64); ok && val == 1 {
 				isDir = true
 			}
+
 			if !isDir {
 				name, _ := item["server_filename"].(string)
 				dlink, _ := item["dlink"].(string)
-				*files = append(*files, FileInfo{Name: name, Dlink: dlink})
+
+				// Ekstrak ukuran file (bisa float64 atau string dari JSON)
+				var size int64 = 0
+				if s, ok := item["size"].(float64); ok {
+					size = int64(s)
+				} else if sStr, ok := item["size"].(string); ok {
+					parsedSize, _ := strconv.ParseInt(sStr, 10, 64)
+					size = parsedSize
+				}
+
+				*files = append(*files, FileInfo{
+					Name:  name,
+					Size:  size,
+					Dlink: dlink,
+				})
 			} else {
 				if subPath, ok := item["path"].(string); ok {
 					collectAllFiles(client, surl, subPath, files)
@@ -207,31 +223,36 @@ func collectAllFiles(client *http.Client, surl string, path string, files *[]Fil
 }
 
 // =========================
-// WEB API HANDLER
+// STRUCT UNTUK OUTPUT JSON
 // =========================
-type FileOutput struct {
-	Filename string          `json:"filename"`
-	DlinkRaw json.RawMessage `json:"dlink_raw"`
+type OutputFile struct {
+	Filename   string `json:"filename"`
+	Size       int64  `json:"size"`
+	DirectLink string `json:"direct_link"`
 }
 
 type APIResponse struct {
-	Files []FileOutput `json:"files"`
+	Total int          `json:"total"`
+	Files []OutputFile `json:"files"`
 }
 
+// =========================
+// WEB API HANDLER
+// =========================
 func teraboxHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		w.Write([]byte(`{"error": "method not allowed"}`))
 		return
 	}
 
 	rawURL := r.URL.Query().Get("url")
 	if rawURL == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "missing 'url' query parameter"})
+		w.Write([]byte(`{"error": "missing 'url' query parameter"}`))
 		return
 	}
 
@@ -240,72 +261,72 @@ func teraboxHandler(w http.ResponseWriter, r *http.Request) {
 	surl := extractSurl(rawURL, client)
 	if surl == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "invalid terabox URL or surl"})
+		w.Write([]byte(`{"error": "invalid terabox URL or surl"}`))
 		return
 	}
+
 
 	var files []FileInfo
 	collectAllFiles(client, surl, "", &files)
 
-	var outputFiles []FileOutput
 
+	var finalFiles []OutputFile
+
+	
 	for _, f := range files {
 		if f.Dlink == "" {
-			errObj := map[string]string{"error": "no dlink field"}
-			errBytes, _ := json.Marshal(errObj)
-			outputFiles = append(outputFiles, FileOutput{
-				Filename: f.Name,
-				DlinkRaw: errBytes,
-			})
 			continue
 		}
 
-		rawDlink, err := getDlinkRaw(client, f.Dlink)
-		if err != nil {
-			errObj := map[string]string{"error": err.Error()}
-			errBytes, _ := json.Marshal(errObj)
-			outputFiles = append(outputFiles, FileOutput{
-				Filename: f.Name,
-				DlinkRaw: errBytes,
-			})
+		rawDlinkData, err := getDlinkRaw(client, f.Dlink)
+		if err != nil || rawDlinkData == "" {
 			continue
 		}
 
-		outputFiles = append(outputFiles, FileOutput{
-			Filename: f.Name,
-			DlinkRaw: json.RawMessage(rawDlink),
+		
+		var dlinkParsed struct {
+			Urls []struct {
+				URL string `json:"url"`
+			} `json:"urls"`
+		}
+
+		_ = json.Unmarshal([]byte(rawDlinkData), &dlinkParsed)
+
+		finalURL := ""
+		if len(dlinkParsed.Urls) > 0 {
+			finalURL = dlinkParsed.Urls[0].URL
+		}
+
+		
+		finalFiles = append(finalFiles, OutputFile{
+			Filename:   f.Name,
+			Size:       f.Size,
+			DirectLink: finalURL,
 		})
 	}
 
-	response := APIResponse{Files: outputFiles}
-	w.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	enc.Encode(response)
-}
-
-// =========================
-// ROOT HANDLER (redirect to example.com)
-// =========================
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	// Redirect ke example.com (atau bisa juga tampilkan HTML)
-	http.Redirect(w, r, "https://example.com", http.StatusFound)
-	// Alternatif: tampilkan pesan
-	// w.Header().Set("Content-Type", "text/html")
-	// fmt.Fprintf(w, `<html><body><h1>Terabox API</h1><p>Usage: <a href="/api/terabox?url=...">/api/terabox?url=...</a></p><p>Example: <a href="https://example.com">https://example.com</a></p></body></html>`)
-}
-
-func main() {
-	http.HandleFunc("/", rootHandler)               // root path
-	http.HandleFunc("/api/terabox", teraboxHandler) // API endpoint
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	
+	response := APIResponse{
+		Total: len(finalFiles),
+		Files: finalFiles,
 	}
+
+	w.WriteHeader(http.StatusOK)
+
+	
+	jsonBytes, _ := json.MarshalIndent(response, "", "  ")
+
+	
+	finalJSON := strings.ReplaceAll(string(jsonBytes), "\\u0026", "&")
+
+	
+	w.Write([]byte(finalJSON))
+}
+func main() {
+	http.HandleFunc("/api/terabox", teraboxHandler)
+	port := "8080"
 	fmt.Printf("Server running on :%s\n", port)
-	fmt.Println("API endpoint: http://localhost:" + port + "/api/terabox?url=...")
-	fmt.Println("Root path redirects to https://example.com")
+	fmt.Println("Example: http://localhost:8080/api/terabox?url=https://www.terabox.com/s/xxxxx")
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "Server failed: %v\n", err)
 		os.Exit(1)
